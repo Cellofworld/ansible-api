@@ -1,7 +1,6 @@
 package main
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,31 +9,34 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
-	_ "github.com/lib/pq"
 	"github.com/robfig/cron/v3"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+	"gorm.io/gorm/schema"
 
 	"ansible-api/config"
 )
 
+// Модели для GORM
 type PlaybookRequest struct {
 	Playbook  string            `json:"playbook"`
 	Inventory string            `json:"inventory,omitempty"`
-	ExtraVars map[string]string `json:"extra_vars,omitempty"`
+	ExtraVars map[string]string `json:"extra_vars,omitempty" gorm:"-"`
 }
 
 type PlaybookLog struct {
-	ID        int       `json:"id"`
-	Playbook  string    `json:"playbook"`
-	Success   bool      `json:"success"`
-	Output    string    `json:"output"`
-	Error     string    `json:"error"`
-	StartTime time.Time `json:"start_time"`
-	EndTime   time.Time `json:"end_time"`
-	Duration  float64   `json:"duration"`
+	gorm.Model
+	Playbook  string    `gorm:"type:text;not null" json:"playbook"`
+	Success   bool      `gorm:"type:boolean;not null" json:"success"`
+	Output    string    `gorm:"type:text" json:"output"`
+	Error     string    `gorm:"type:text" json:"error"`
+	StartTime time.Time `gorm:"type:timestamptz;not null" json:"start_time"`
+	EndTime   time.Time `gorm:"type:timestamptz;not null" json:"end_time"`
+	Duration  float64   `gorm:"type:decimal;not null" json:"duration"`
 }
 
 type PlaybookRunStatus string
@@ -46,17 +48,38 @@ const (
 )
 
 type PlaybookRun struct {
-	ID          int               `json:"id"`
-	Playbook    string            `json:"playbook"`
-	Inventory   string            `json:"inventory,omitempty"`
-	Status      PlaybookRunStatus `json:"status"`
-	StartTime   time.Time         `json:"start_time"`
-	EndTime     *time.Time        `json:"end_time,omitempty"`
-	Duration    *float64          `json:"duration,omitempty"`
-	TriggeredBy string            `json:"triggered_by,omitempty"`
-	ExtraVars   map[string]string `json:"extra_vars,omitempty"`
-	Output      string            `json:"output,omitempty"`
-	Error       string            `json:"error,omitempty"`
+	gorm.Model
+	Playbook    string            `gorm:"type:text;not null" json:"playbook"`
+	Inventory   string            `gorm:"type:text" json:"inventory,omitempty"`
+	Status      PlaybookRunStatus `gorm:"type:text;not null" json:"status"`
+	StartTime   time.Time         `gorm:"type:timestamptz;not null" json:"start_time"`
+	EndTime     *time.Time        `gorm:"type:timestamptz" json:"end_time,omitempty"`
+	Duration    *float64          `gorm:"type:decimal" json:"duration,omitempty"`
+	TriggeredBy string            `gorm:"type:text" json:"triggered_by,omitempty"`
+	ExtraVars   JSONMap           `gorm:"type:jsonb" json:"extra_vars,omitempty"`
+	Output      string            `gorm:"type:text" json:"output,omitempty"`
+	Error       string            `gorm:"type:text" json:"error,omitempty"`
+}
+
+// JSONMap для работы с JSONB в PostgreSQL
+type JSONMap map[string]string
+
+func (j *JSONMap) Scan(value interface{}) error {
+	if value == nil {
+		return nil
+	}
+	b, ok := value.([]byte)
+	if !ok {
+		return fmt.Errorf("value is not []byte")
+	}
+	return json.Unmarshal(b, &j)
+}
+
+func (j JSONMap) Value() (interface{}, error) {
+	if j == nil {
+		return nil, nil
+	}
+	return json.Marshal(j)
 }
 
 type LogsResponse struct {
@@ -76,7 +99,7 @@ type RunsResponse struct {
 var (
 	cfg     *config.Config
 	mutex   = &sync.Mutex{}
-	db      *sql.DB
+	db      *gorm.DB
 	cronSvc *cron.Cron
 )
 
@@ -99,10 +122,10 @@ func main() {
 	if err := initDB(); err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
-	defer db.Close()
 
-	if err := applyMigrations(); err != nil {
-		log.Fatalf("Failed to apply migrations: %v", err)
+	// Автомиграции - создание таблиц
+	if err := db.AutoMigrate(&PlaybookRun{}, &PlaybookLog{}); err != nil {
+		log.Fatalf("Failed to auto-migrate database: %v", err)
 	}
 
 	server := &http.Server{
@@ -124,7 +147,7 @@ func main() {
 }
 
 func initDB() error {
-	psqlInfo := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s search_path=ansible_api,public",
 		cfg.Database.Host,
 		cfg.Database.Port,
 		cfg.Database.User,
@@ -134,39 +157,25 @@ func initDB() error {
 	)
 
 	var err error
-	db, err = sql.Open("postgres", psqlInfo)
+	db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Info),
+		NamingStrategy: schema.NamingStrategy{
+			TablePrefix:   "ansible_api.", // Все таблицы будут созданы в схеме ansible_api
+			SingularTable: true,
+		},
+	})
 	if err != nil {
 		return err
 	}
 
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(25)
-	db.SetConnMaxLifetime(5 * time.Minute)
-
-	return db.Ping()
-}
-
-func applyMigrations() error {
-	var tableExists bool
-	err := db.QueryRow("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'migrations')").Scan(&tableExists)
+	sqlDB, err := db.DB()
 	if err != nil {
 		return err
 	}
 
-	if !tableExists {
-		migrationSQL, err := os.ReadFile("migrations/001_initial.sql")
-		if err != nil {
-			return err
-		}
-
-		if _, err := db.Exec(string(migrationSQL)); err != nil {
-			return err
-		}
-
-		if _, err := db.Exec("INSERT INTO migrations (name) VALUES ($1)", "001_initial"); err != nil {
-			return err
-		}
-	}
+	sqlDB.SetMaxOpenConns(25)
+	sqlDB.SetMaxIdleConns(25)
+	sqlDB.SetConnMaxLifetime(5 * time.Minute)
 
 	return nil
 }
@@ -176,21 +185,21 @@ func cleanupOldLogs() {
 
 	retentionPeriod := time.Now().AddDate(0, 0, -cfg.Logging.RetentionDays)
 
-	result, err := db.Exec(`
-		DELETE FROM playbook_logs 
-		WHERE start_time < $1;
-		
-		DELETE FROM playbook_runs
-		WHERE start_time < $1;
-	`, retentionPeriod)
-
-	if err != nil {
-		log.Printf("Error cleaning up old logs: %v", err)
+	// Удаление старых логов
+	result := db.Where("start_time < ?", retentionPeriod).Delete(&PlaybookLog{})
+	if result.Error != nil {
+		log.Printf("Error cleaning up old logs: %v", result.Error)
 		return
 	}
 
-	rowsAffected, _ := result.RowsAffected()
-	log.Printf("Cleaned up %d old log entries", rowsAffected)
+	// Удаление старых запусков
+	result = db.Where("start_time < ?", retentionPeriod).Delete(&PlaybookRun{})
+	if result.Error != nil {
+		log.Printf("Error cleaning up old runs: %v", result.Error)
+		return
+	}
+
+	log.Printf("Cleaned up %d old log entries", result.RowsAffected)
 }
 
 func runPlaybookHandler(w http.ResponseWriter, r *http.Request) {
@@ -232,15 +241,15 @@ func runPlaybookHandler(w http.ResponseWriter, r *http.Request) {
 		endTime := time.Now()
 		duration := endTime.Sub(startTime).Seconds()
 
-		// Log to playbook_logs
+		// Логирование выполнения
 		success := err == nil
 		errorMsg := ""
 		if err != nil {
 			errorMsg = err.Error()
 		}
-		_, _ = logExecution(req.Playbook, success, output, errorMsg, startTime, endTime, duration)
+		_ = logExecution(req.Playbook, success, output, errorMsg, startTime, endTime, duration)
 
-		// Update playbook_runs
+		// Обновление статуса запуска
 		if err != nil {
 			_ = updatePlaybookRun(runID, RunStatusFailed, output, err.Error())
 		} else {
@@ -296,95 +305,55 @@ func listLogsHandler(w http.ResponseWriter, r *http.Request) {
 	dateFrom := queryParams.Get("from")
 	dateTo := queryParams.Get("to")
 
-	baseQuery := "SELECT id, playbook, success, output, error, start_time, end_time, duration FROM playbook_logs"
-	countQuery := "SELECT COUNT(*) FROM playbook_logs"
-
-	var filters []string
-	var args []interface{}
-	argPos := 1
+	query := db.Model(&PlaybookLog{})
 
 	if successFilter != "" {
 		success, err := strconv.ParseBool(successFilter)
 		if err == nil {
-			filters = append(filters, fmt.Sprintf("success = $%d", argPos))
-			args = append(args, success)
-			argPos++
+			query = query.Where("success = ?", success)
 		}
 	}
 
 	if playbookFilter != "" {
-		filters = append(filters, fmt.Sprintf("playbook = $%d", argPos))
-		args = append(args, playbookFilter)
-		argPos++
+		query = query.Where("playbook = ?", playbookFilter)
 	}
 
 	if dateFrom != "" {
 		if fromTime, err := time.Parse(time.RFC3339, dateFrom); err == nil {
-			filters = append(filters, fmt.Sprintf("start_time >= $%d", argPos))
-			args = append(args, fromTime)
-			argPos++
+			query = query.Where("start_time >= ?", fromTime)
 		}
 	}
 
 	if dateTo != "" {
 		if toTime, err := time.Parse(time.RFC3339, dateTo); err == nil {
-			filters = append(filters, fmt.Sprintf("start_time <= $%d", argPos))
-			args = append(args, toTime)
-			argPos++
+			query = query.Where("start_time <= ?", toTime)
 		}
 	}
 
-	whereClause := ""
-	if len(filters) > 0 {
-		whereClause = " WHERE " + strings.Join(filters, " AND ")
-	}
-
-	var totalCount int
-	err := db.QueryRow(countQuery+whereClause, args...).Scan(&totalCount)
-	if err != nil {
+	var totalCount int64
+	if err := query.Count(&totalCount).Error; err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	totalPages := (totalCount + cfg.Logging.PageSize - 1) / cfg.Logging.PageSize
+	totalPages := (int(totalCount) + cfg.Logging.PageSize - 1) / cfg.Logging.PageSize
 	if page > totalPages && totalPages > 0 {
 		page = totalPages
 	}
 	offset := (page - 1) * cfg.Logging.PageSize
 
-	query := fmt.Sprintf("%s%s ORDER BY start_time DESC LIMIT %d OFFSET %d",
-		baseQuery, whereClause, cfg.Logging.PageSize, offset)
-
-	rows, err := db.Query(query, args...)
-	if err != nil {
+	var logs []PlaybookLog
+	if err := query.Order("start_time DESC").
+		Limit(cfg.Logging.PageSize).
+		Offset(offset).
+		Find(&logs).Error; err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
-	}
-	defer rows.Close()
-
-	var logs []PlaybookLog
-	for rows.Next() {
-		var logEntry PlaybookLog
-		err := rows.Scan(
-			&logEntry.ID,
-			&logEntry.Playbook,
-			&logEntry.Success,
-			&logEntry.Output,
-			&logEntry.Error,
-			&logEntry.StartTime,
-			&logEntry.EndTime,
-			&logEntry.Duration,
-		)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		logs = append(logs, logEntry)
 	}
 
 	response := LogsResponse{
 		Logs:        logs,
-		TotalCount:  totalCount,
+		TotalCount:  int(totalCount),
 		CurrentPage: page,
 		TotalPages:  totalPages,
 	}
@@ -407,22 +376,8 @@ func getLogHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var logEntry PlaybookLog
-	query := `SELECT id, playbook, success, output, error, start_time, end_time, duration 
-	          FROM playbook_logs WHERE id = $1`
-
-	err = db.QueryRow(query, id).Scan(
-		&logEntry.ID,
-		&logEntry.Playbook,
-		&logEntry.Success,
-		&logEntry.Output,
-		&logEntry.Error,
-		&logEntry.StartTime,
-		&logEntry.EndTime,
-		&logEntry.Duration,
-	)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
+	if err := db.First(&logEntry, id).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
 			http.Error(w, "Log not found", http.StatusNotFound)
 		} else {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -451,107 +406,52 @@ func getPlaybookRunsHandler(w http.ResponseWriter, r *http.Request) {
 	dateFrom := queryParams.Get("from")
 	dateTo := queryParams.Get("to")
 
-	baseQuery := "SELECT id, playbook, inventory, status, start_time, end_time, duration, triggered_by FROM playbook_runs"
-	countQuery := "SELECT COUNT(*) FROM playbook_runs"
-
-	var filters []string
-	var args []interface{}
-	argPos := 1
+	query := db.Model(&PlaybookRun{})
 
 	if statusFilter != "" {
-		filters = append(filters, fmt.Sprintf("status = $%d", argPos))
-		args = append(args, statusFilter)
-		argPos++
+		query = query.Where("status = ?", statusFilter)
 	}
 
 	if playbookFilter != "" {
-		filters = append(filters, fmt.Sprintf("playbook = $%d", argPos))
-		args = append(args, playbookFilter)
-		argPos++
+		query = query.Where("playbook = ?", playbookFilter)
 	}
 
 	if dateFrom != "" {
 		if fromTime, err := time.Parse(time.RFC3339, dateFrom); err == nil {
-			filters = append(filters, fmt.Sprintf("start_time >= $%d", argPos))
-			args = append(args, fromTime)
-			argPos++
+			query = query.Where("start_time >= ?", fromTime)
 		}
 	}
 
 	if dateTo != "" {
 		if toTime, err := time.Parse(time.RFC3339, dateTo); err == nil {
-			filters = append(filters, fmt.Sprintf("start_time <= $%d", argPos))
-			args = append(args, toTime)
-			argPos++
+			query = query.Where("start_time <= ?", toTime)
 		}
 	}
 
-	whereClause := ""
-	if len(filters) > 0 {
-		whereClause = " WHERE " + strings.Join(filters, " AND ")
-	}
-
-	var totalCount int
-	err := db.QueryRow(countQuery+whereClause, args...).Scan(&totalCount)
-	if err != nil {
+	var totalCount int64
+	if err := query.Count(&totalCount).Error; err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	totalPages := (totalCount + cfg.Logging.PageSize - 1) / cfg.Logging.PageSize
+	totalPages := (int(totalCount) + cfg.Logging.PageSize - 1) / cfg.Logging.PageSize
 	if page > totalPages && totalPages > 0 {
 		page = totalPages
 	}
 	offset := (page - 1) * cfg.Logging.PageSize
 
-	query := fmt.Sprintf("%s%s ORDER BY start_time DESC LIMIT %d OFFSET %d",
-		baseQuery, whereClause, cfg.Logging.PageSize, offset)
-
-	rows, err := db.Query(query, args...)
-	if err != nil {
+	var runs []PlaybookRun
+	if err := query.Order("start_time DESC").
+		Limit(cfg.Logging.PageSize).
+		Offset(offset).
+		Find(&runs).Error; err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
-	}
-	defer rows.Close()
-
-	var runs []PlaybookRun
-	for rows.Next() {
-		var run PlaybookRun
-		var endTime sql.NullTime
-		var duration sql.NullFloat64
-		var inventory sql.NullString
-
-		err := rows.Scan(
-			&run.ID,
-			&run.Playbook,
-			&inventory,
-			&run.Status,
-			&run.StartTime,
-			&endTime,
-			&duration,
-			&run.TriggeredBy,
-		)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		if inventory.Valid {
-			run.Inventory = inventory.String
-		}
-		if endTime.Valid {
-			run.EndTime = &endTime.Time
-		}
-		if duration.Valid {
-			run.Duration = &duration.Float64
-		}
-
-		runs = append(runs, run)
 	}
 
 	response := RunsResponse{
 		Runs:        runs,
-		TotalCount:  totalCount,
+		TotalCount:  int(totalCount),
 		CurrentPage: page,
 		TotalPages:  totalPages,
 	}
@@ -574,33 +474,8 @@ func getPlaybookRunDetailsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var run PlaybookRun
-	var endTime sql.NullTime
-	var duration sql.NullFloat64
-	var inventory sql.NullString
-	var extraVarsJSON []byte
-
-	err = db.QueryRow(`
-		SELECT 
-			id, playbook, inventory, status, start_time, end_time, duration, 
-			triggered_by, extra_vars, output, error
-		FROM playbook_runs 
-		WHERE id = $1
-	`, id).Scan(
-		&run.ID,
-		&run.Playbook,
-		&inventory,
-		&run.Status,
-		&run.StartTime,
-		&endTime,
-		&duration,
-		&run.TriggeredBy,
-		&extraVarsJSON,
-		&run.Output,
-		&run.Error,
-	)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
+	if err := db.First(&run, id).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
 			http.Error(w, "Run not found", http.StatusNotFound)
 		} else {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -608,83 +483,47 @@ func getPlaybookRunDetailsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if inventory.Valid {
-		run.Inventory = inventory.String
-	}
-	if endTime.Valid {
-		run.EndTime = &endTime.Time
-	}
-	if duration.Valid {
-		run.Duration = &duration.Float64
-	}
-
-	if len(extraVarsJSON) > 0 {
-		if err := json.Unmarshal(extraVarsJSON, &run.ExtraVars); err != nil {
-			log.Printf("Failed to unmarshal extra_vars for run %d: %v", id, err)
-		}
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(run)
 }
 
-func logPlaybookStart(req PlaybookRequest, remoteAddr string) (int, error) {
-	extraVarsJSON, err := json.Marshal(req.ExtraVars)
-	if err != nil {
+func logPlaybookStart(req PlaybookRequest, remoteAddr string) (uint, error) {
+	run := PlaybookRun{
+		Playbook:    req.Playbook,
+		Inventory:   req.Inventory,
+		Status:      RunStatusStarted,
+		StartTime:   time.Now(),
+		TriggeredBy: remoteAddr,
+		ExtraVars:   req.ExtraVars,
+	}
+
+	if err := db.Create(&run).Error; err != nil {
 		return 0, err
 	}
 
-	var runID int
-	err = db.QueryRow(`
-		INSERT INTO playbook_runs 
-		(playbook, inventory, status, start_time, triggered_by, extra_vars)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id
-	`,
-		req.Playbook,
-		req.Inventory,
-		RunStatusStarted,
-		time.Now(),
-		remoteAddr,
-		extraVarsJSON,
-	).Scan(&runID)
-
-	return runID, err
+	return run.ID, nil
 }
 
-func updatePlaybookRun(runID int, status PlaybookRunStatus, output, errorMsg string) error {
-	var endTime time.Time
-	var duration float64
-
-	if status != RunStatusStarted {
-		endTime = time.Now()
-		var startTime time.Time
-		err := db.QueryRow("SELECT start_time FROM playbook_runs WHERE id = $1", runID).Scan(&startTime)
-		if err != nil {
-			return err
-		}
-		duration = endTime.Sub(startTime).Seconds()
+func updatePlaybookRun(runID uint, status PlaybookRunStatus, output, errorMsg string) error {
+	updates := map[string]interface{}{
+		"status": status,
+		"output": output,
+		"error":  errorMsg,
 	}
 
-	_, err := db.Exec(`
-		UPDATE playbook_runs 
-		SET 
-			status = $1,
-			end_time = $2,
-			duration = $3,
-			output = $4,
-			error = $5
-		WHERE id = $6
-	`,
-		status,
-		endTime,
-		duration,
-		output,
-		errorMsg,
-		runID,
-	)
+	if status != RunStatusStarted {
+		endTime := time.Now()
+		var startTime time.Time
+		if err := db.Model(&PlaybookRun{}).Where("id = ?", runID).Pluck("start_time", &startTime).Error; err != nil {
+			return err
+		}
+		duration := endTime.Sub(startTime).Seconds()
 
-	return err
+		updates["end_time"] = endTime
+		updates["duration"] = duration
+	}
+
+	return db.Model(&PlaybookRun{}).Where("id = ?", runID).Updates(updates).Error
 }
 
 func runAnsiblePlaybook(playbookPath, inventory string, extraVars map[string]string) (string, error) {
@@ -714,22 +553,16 @@ func runAnsiblePlaybook(playbookPath, inventory string, extraVars map[string]str
 	return string(output), err
 }
 
-func logExecution(playbook string, success bool, output, errorMsg string, startTime, endTime time.Time, duration float64) (int, error) {
-	query := `INSERT INTO playbook_logs 
-	          (playbook, success, output, error, start_time, end_time, duration) 
-	          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`
+func logExecution(playbook string, success bool, output, errorMsg string, startTime, endTime time.Time, duration float64) error {
+	logEntry := PlaybookLog{
+		Playbook:  playbook,
+		Success:   success,
+		Output:    output,
+		Error:     errorMsg,
+		StartTime: startTime,
+		EndTime:   endTime,
+		Duration:  duration,
+	}
 
-	var id int
-	err := db.QueryRow(
-		query,
-		playbook,
-		success,
-		output,
-		errorMsg,
-		startTime,
-		endTime,
-		duration,
-	).Scan(&id)
-
-	return id, err
+	return db.Create(&logEntry).Error
 }
