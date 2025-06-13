@@ -1,0 +1,134 @@
+Основные возможности
+🚀 Запуск Ansible playbooks через API
+
+📦 Хранение инвентарей в базе данных
+
+✅ Проверка доступности хостов из инвентаря
+
+📊 Логирование всех операций
+
+🔍 Просмотр истории выполнения
+
+⏱ Автоматическая очистка старых записей
+
+Требования
+Go 1.16+
+
+PostgreSQL 12+
+
+Ansible 2.9+
+
+Установка
+Клонируйте репозиторий:
+
+bash
+git clone https://github.com/yourusername/ansible-api.git
+cd ansible-api
+Установите зависимости:
+
+bash
+go mod download
+Настройте конфигурацию:
+Создайте файл config.yaml на основе примера:
+
+yaml
+server:
+  port: "8080"
+  playbooks_dir: "./playbooks"
+  read_timeout: 30s
+  write_timeout: 30s
+
+database:
+  host: "localhost"
+  port: 5432
+  user: "ansible"
+  password: "password"
+  name: "ansible_api"
+  sslmode: "disable"
+
+logging:
+  retention_days: 30
+  page_size: 20
+Запуск
+bash
+go run main.go
+Сервер будет доступен по адресу: http://localhost:8080
+
+API Endpoints
+Инвентари
+POST /api/inventories - Создать новый инвентарь
+
+GET /api/inventories - Список всех инвентарей
+
+GET /api/inventories/{name} - Получить инвентарь по имени
+
+PUT /api/inventories/{name} - Обновить инвентарь
+
+DELETE /api/inventories/{name} - Удалить инвентарь
+
+POST /api/inventories/{name}/check - Проверить доступность хостов
+
+Playbooks
+GET /api/playbooks - Список доступных playbooks
+
+POST /api/run - Запустить playbook
+
+Логи
+GET /api/runs - История запусков
+
+GET /api/runs/{id} - Детали запуска
+
+GET /api/logs - Логи выполнения
+
+GET /api/logs/{id} - Детали лога
+
+Проверки инвентарей
+GET /api/inventory-checks - История проверок
+
+GET /api/inventory-checks/{id} - Результаты проверки
+
+Примеры использования
+Создание инвентаря
+bash
+curl -X POST http://localhost:8080/api/inventories \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "production",
+    "content": "[web]\nserver1 ansible_host=192.168.1.100\nserver2 ansible_host=192.168.1.101"
+  }'
+Запуск playbook
+bash
+curl -X POST http://localhost:8080/api/run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "playbook": "deploy.yml",
+    "inventory": "production",
+    "extra_vars": {
+      "version": "1.0.0"
+    }
+  }'
+Проверка доступности хостов
+bash
+curl -X POST http://localhost:8080/api/inventories/production/check
+Настройка окружения
+Создайте директорию для playbooks:
+
+bash
+mkdir playbooks
+Поместите ваши playbook-файлы (с расширением .yml) в директорию playbooks
+
+Настройте подключение к PostgreSQL в файле config.yaml
+
+Развертывание в production
+Для production использования рекомендуется:
+
+Скомпилировать бинарник:
+
+bash
+go build -o ansible-api
+Запускать через systemd или другой процесс-менеджер
+
+Настроить reverse proxy (Nginx/Apache) для HTTPS
+
+Лицензия
+MIT License
