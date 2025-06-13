@@ -1,0 +1,22 @@
+server:
+  port: "8080"
+  playbooks_dir: "./playbooks"
+  read_timeout: "10s"
+  write_timeout: "10s"
+
+database:
+  host: "192.168.0.173"
+  port: 5432
+  user: "ansible"
+  password: "admin"
+  name: "ansible_logs"
+  ssl_mode: "disable"
+  schema: "ansible_api"
+
+logging:
+  retention_days: 30
+  page_size: 20
+
+ansible:
+  timeout: 3600
+  default_python: "/usr/bin/python3"
