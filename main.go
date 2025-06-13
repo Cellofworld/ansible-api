@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -9,9 +10,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/gorilla/mux"
 	"github.com/robfig/cron/v3"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -61,6 +64,31 @@ type PlaybookRun struct {
 	Error       string            `gorm:"type:text" json:"error,omitempty"`
 }
 
+type Inventory struct {
+	gorm.Model
+	Name    string `gorm:"type:text;not null;unique" json:"name"`
+	Content string `gorm:"type:text;not null" json:"content"`
+}
+
+type InventoryCheckStatus string
+
+const (
+	CheckStatusPending   InventoryCheckStatus = "pending"
+	CheckStatusRunning   InventoryCheckStatus = "running"
+	CheckStatusCompleted InventoryCheckStatus = "completed"
+	CheckStatusFailed    InventoryCheckStatus = "failed"
+)
+
+type InventoryCheck struct {
+	gorm.Model
+	InventoryID uint                 `gorm:"not null" json:"inventory_id"`
+	Status      InventoryCheckStatus `gorm:"type:text" json:"status"`
+	Results     JSONMap              `gorm:"type:jsonb" json:"results"`
+	Error       string               `gorm:"type:text" json:"error"`
+	StartedAt   time.Time            `gorm:"type:timestamptz" json:"started_at"`
+	CompletedAt *time.Time           `gorm:"type:timestamptz" json:"completed_at"`
+}
+
 // JSONMap для работы с JSONB в PostgreSQL
 type JSONMap map[string]string
 
@@ -96,6 +124,16 @@ type RunsResponse struct {
 	TotalPages  int           `json:"total_pages"`
 }
 
+type InventoriesResponse struct {
+	Inventories []Inventory `json:"inventories"`
+	TotalCount  int         `json:"total_count"`
+}
+
+type InventoryChecksResponse struct {
+	Checks     []InventoryCheck `json:"checks"`
+	TotalCount int              `json:"total_count"`
+}
+
 var (
 	cfg     *config.Config
 	mutex   = &sync.Mutex{}
@@ -124,23 +162,42 @@ func main() {
 	}
 
 	// Автомиграции - создание таблиц
-	if err := db.AutoMigrate(&PlaybookRun{}, &PlaybookLog{}); err != nil {
+	if err := db.AutoMigrate(&PlaybookRun{}, &PlaybookLog{}, &Inventory{}, &InventoryCheck{}); err != nil {
 		log.Fatalf("Failed to auto-migrate database: %v", err)
 	}
 
+	r := mux.NewRouter()
+
+	// Playbook endpoints
+	r.HandleFunc("/api/run", runPlaybookHandler).Methods("POST")
+	r.HandleFunc("/api/playbooks", listPlaybooksHandler).Methods("GET")
+
+	// Log endpoints
+	r.HandleFunc("/api/logs", listLogsHandler).Methods("GET")
+	r.HandleFunc("/api/logs/{id}", getLogHandler).Methods("GET")
+
+	// Run endpoints
+	r.HandleFunc("/api/runs", getPlaybookRunsHandler).Methods("GET")
+	r.HandleFunc("/api/runs/{id}", getPlaybookRunDetailsHandler).Methods("GET")
+
+	// Inventory endpoints
+	r.HandleFunc("/api/inventories", listInventoriesHandler).Methods("GET")
+	r.HandleFunc("/api/inventories", createInventoryHandler).Methods("POST")
+	r.HandleFunc("/api/inventories/{name}", getInventoryHandler).Methods("GET")
+	r.HandleFunc("/api/inventories/{name}", updateInventoryHandler).Methods("PUT")
+	r.HandleFunc("/api/inventories/{name}", deleteInventoryHandler).Methods("DELETE")
+	r.HandleFunc("/api/inventories/{name}/check", checkInventoryHandler).Methods("POST")
+
+	// Inventory check endpoints
+	r.HandleFunc("/api/inventory-checks", listInventoryChecksHandler).Methods("GET")
+	r.HandleFunc("/api/inventory-checks/{id}", getInventoryCheckHandler).Methods("GET")
+
 	server := &http.Server{
 		Addr:         ":" + cfg.Server.Port,
-		Handler:      nil,
+		Handler:      r,
 		ReadTimeout:  cfg.Server.ReadTimeout,
 		WriteTimeout: cfg.Server.WriteTimeout,
 	}
-
-	http.HandleFunc("/api/run", runPlaybookHandler)
-	http.HandleFunc("/api/playbooks", listPlaybooksHandler)
-	http.HandleFunc("/api/logs", listLogsHandler)
-	http.HandleFunc("/api/logs/", getLogHandler)
-	http.HandleFunc("/api/runs", getPlaybookRunsHandler)
-	http.HandleFunc("/api/runs/", getPlaybookRunDetailsHandler)
 
 	log.Printf("Server started on :%s", cfg.Server.Port)
 	log.Fatal(server.ListenAndServe())
@@ -196,6 +253,13 @@ func cleanupOldLogs() {
 	result = db.Where("start_time < ?", retentionPeriod).Delete(&PlaybookRun{})
 	if result.Error != nil {
 		log.Printf("Error cleaning up old runs: %v", result.Error)
+		return
+	}
+
+	// Удаление старых проверок инвентарей
+	result = db.Where("started_at < ?", retentionPeriod).Delete(&InventoryCheck{})
+	if result.Error != nil {
+		log.Printf("Error cleaning up old inventory checks: %v", result.Error)
 		return
 	}
 
@@ -368,7 +432,8 @@ func getLogHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idStr := r.URL.Path[len("/api/logs/"):]
+	vars := mux.Vars(r)
+	idStr := vars["id"]
 	id, err := strconv.Atoi(idStr)
 	if err != nil {
 		http.Error(w, "Invalid log ID", http.StatusBadRequest)
@@ -377,7 +442,7 @@ func getLogHandler(w http.ResponseWriter, r *http.Request) {
 
 	var logEntry PlaybookLog
 	if err := db.First(&logEntry, id).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			http.Error(w, "Log not found", http.StatusNotFound)
 		} else {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -466,7 +531,8 @@ func getPlaybookRunDetailsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	idStr := r.URL.Path[len("/api/runs/"):]
+	vars := mux.Vars(r)
+	idStr := vars["id"]
 	id, err := strconv.Atoi(idStr)
 	if err != nil {
 		http.Error(w, "Invalid run ID", http.StatusBadRequest)
@@ -475,7 +541,7 @@ func getPlaybookRunDetailsHandler(w http.ResponseWriter, r *http.Request) {
 
 	var run PlaybookRun
 	if err := db.First(&run, id).Error; err != nil {
-		if err == gorm.ErrRecordNotFound {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			http.Error(w, "Run not found", http.StatusNotFound)
 		} else {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -526,14 +592,29 @@ func updatePlaybookRun(runID uint, status PlaybookRunStatus, output, errorMsg st
 	return db.Model(&PlaybookRun{}).Where("id = ?", runID).Updates(updates).Error
 }
 
-func runAnsiblePlaybook(playbookPath, inventory string, extraVars map[string]string) (string, error) {
+func runAnsiblePlaybook(playbookPath, inventoryName string, extraVars map[string]string) (string, error) {
 	args := []string{"ansible-playbook", playbookPath}
 
-	if inventory != "" {
-		inventoryPath := filepath.Join(cfg.Server.PlaybooksDir, inventory)
-		if _, err := os.Stat(inventoryPath); err == nil {
-			args = append(args, "-i", inventoryPath)
+	if inventoryName != "" {
+		inventoryContent, err := getInventoryContent(inventoryName)
+		if err != nil {
+			return "", fmt.Errorf("failed to get inventory: %v", err)
 		}
+
+		tmpfile, err := os.CreateTemp("", "inventory-*.ini")
+		if err != nil {
+			return "", fmt.Errorf("failed to create temp inventory file: %v", err)
+		}
+		defer os.Remove(tmpfile.Name())
+
+		if _, err := tmpfile.WriteString(inventoryContent); err != nil {
+			return "", fmt.Errorf("failed to write inventory content: %v", err)
+		}
+		if err := tmpfile.Close(); err != nil {
+			return "", fmt.Errorf("failed to close temp file: %v", err)
+		}
+
+		args = append(args, "-i", tmpfile.Name())
 	}
 
 	if len(extraVars) > 0 {
@@ -565,4 +646,339 @@ func logExecution(playbook string, success bool, output, errorMsg string, startT
 	}
 
 	return db.Create(&logEntry).Error
+}
+
+// Inventory handlers
+func listInventoriesHandler(w http.ResponseWriter, r *http.Request) {
+	queryParams := r.URL.Query()
+	page, _ := strconv.Atoi(queryParams.Get("page"))
+	if page < 1 {
+		page = 1
+	}
+
+	query := db.Model(&Inventory{})
+
+	var totalCount int64
+	if err := query.Count(&totalCount).Error; err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	totalPages := (int(totalCount) + cfg.Logging.PageSize - 1) / cfg.Logging.PageSize
+	if page > totalPages && totalPages > 0 {
+		page = totalPages
+	}
+	offset := (page - 1) * cfg.Logging.PageSize
+
+	var inventories []Inventory
+	if err := query.Order("name ASC").
+		Limit(cfg.Logging.PageSize).
+		Offset(offset).
+		Find(&inventories).Error; err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	response := InventoriesResponse{
+		Inventories: inventories,
+		TotalCount:  int(totalCount),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func createInventoryHandler(w http.ResponseWriter, r *http.Request) {
+	var inv Inventory
+	if err := json.NewDecoder(r.Body).Decode(&inv); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if inv.Name == "" || inv.Content == "" {
+		http.Error(w, "Name and content are required", http.StatusBadRequest)
+		return
+	}
+
+	if err := db.Create(&inv).Error; err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(inv)
+}
+
+func getInventoryHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	name := vars["name"]
+
+	var inv Inventory
+	if err := db.Where("name = ?", name).First(&inv).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			http.Error(w, "Inventory not found", http.StatusNotFound)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(inv)
+}
+
+func updateInventoryHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	name := vars["name"]
+
+	var inv Inventory
+	if err := db.Where("name = ?", name).First(&inv).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			http.Error(w, "Inventory not found", http.StatusNotFound)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	var updateData Inventory
+	if err := json.NewDecoder(r.Body).Decode(&updateData); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if updateData.Content != "" {
+		inv.Content = updateData.Content
+	}
+
+	if err := db.Save(&inv).Error; err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(inv)
+}
+
+func deleteInventoryHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	name := vars["name"]
+
+	if err := db.Where("name = ?", name).Delete(&Inventory{}).Error; err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func checkInventoryHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	inventoryName := vars["name"]
+
+	var inv Inventory
+	if err := db.Where("name = ?", inventoryName).First(&inv).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			http.Error(w, "Inventory not found", http.StatusNotFound)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// Создаем запись о проверке
+	check := InventoryCheck{
+		InventoryID: inv.ID,
+		Status:      CheckStatusPending,
+		StartedAt:   time.Now(),
+	}
+	if err := db.Create(&check).Error; err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Запускаем проверку в фоне
+	go func() {
+		// Обновляем статус на "running"
+		db.Model(&InventoryCheck{}).Where("id = ?", check.ID).Update("status", CheckStatusRunning)
+
+		results, err := testInventoryHosts(inventoryName)
+
+		updates := map[string]interface{}{
+			"completed_at": time.Now(),
+		}
+
+		if err != nil {
+			updates["status"] = CheckStatusFailed
+			updates["error"] = err.Error()
+		} else {
+			updates["status"] = CheckStatusCompleted
+			updates["results"] = results
+		}
+
+		db.Model(&InventoryCheck{}).Where("id = ?", check.ID).Updates(updates)
+	}()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"check_id": check.ID,
+		"status":   "started",
+	})
+}
+
+func listInventoryChecksHandler(w http.ResponseWriter, r *http.Request) {
+	queryParams := r.URL.Query()
+	page, _ := strconv.Atoi(queryParams.Get("page"))
+	if page < 1 {
+		page = 1
+	}
+
+	inventoryID := queryParams.Get("inventory_id")
+	statusFilter := queryParams.Get("status")
+
+	query := db.Model(&InventoryCheck{})
+
+	if inventoryID != "" {
+		query = query.Where("inventory_id = ?", inventoryID)
+	}
+
+	if statusFilter != "" {
+		query = query.Where("status = ?", statusFilter)
+	}
+
+	var totalCount int64
+	if err := query.Count(&totalCount).Error; err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	totalPages := (int(totalCount) + cfg.Logging.PageSize - 1) / cfg.Logging.PageSize
+	if page > totalPages && totalPages > 0 {
+		page = totalPages
+	}
+	offset := (page - 1) * cfg.Logging.PageSize
+
+	var checks []InventoryCheck
+	if err := query.Preload("Inventory").
+		Order("started_at DESC").
+		Limit(cfg.Logging.PageSize).
+		Offset(offset).
+		Find(&checks).Error; err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	response := InventoryChecksResponse{
+		Checks:     checks,
+		TotalCount: int(totalCount),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
+func getInventoryCheckHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	checkID := vars["id"]
+
+	var check InventoryCheck
+	if err := db.Preload("Inventory").First(&check, checkID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			http.Error(w, "Check not found", http.StatusNotFound)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(check)
+}
+
+func testInventoryHosts(inventoryName string) (map[string]string, error) {
+	// Получаем содержимое инвентаря
+	inventoryContent, err := getInventoryContent(inventoryName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get inventory: %v", err)
+	}
+
+	// Создаем временный playbook для проверки
+	playbookContent := `---
+- hosts: all
+  gather_facts: no
+  tasks:
+    - name: Test host connectivity
+      ansible.builtin.ping:
+      register: ping_result
+      ignore_errors: yes
+
+    - name: Collect results
+      ansible.builtin.set_fact:
+        host_status: "{{ 'reachable' if ping_result.ping == 'pong' else 'unreachable' }}"
+
+    - name: Print results
+      ansible.builtin.debug:
+        msg: "Host {{ inventory_hostname }} is {{ host_status }}"
+    `
+
+	tmpPlaybook, err := os.CreateTemp("", "check-hosts-*.yml")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp playbook: %v", err)
+	}
+	defer os.Remove(tmpPlaybook.Name())
+
+	if _, err := tmpPlaybook.WriteString(playbookContent); err != nil {
+		return nil, fmt.Errorf("failed to write playbook: %v", err)
+	}
+	tmpPlaybook.Close()
+
+	// Создаем временный inventory файл
+	tmpInventory, err := os.CreateTemp("", "inventory-*.ini")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp inventory: %v", err)
+	}
+	defer os.Remove(tmpInventory.Name())
+
+	if _, err := tmpInventory.WriteString(inventoryContent); err != nil {
+		return nil, fmt.Errorf("failed to write inventory: %v", err)
+	}
+	tmpInventory.Close()
+
+	// Запускаем Ansible
+	cmd := exec.Command("ansible-playbook", tmpPlaybook.Name(), "-i", tmpInventory.Name())
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("ansible failed: %v\nOutput:\n%s", err, string(output))
+	}
+
+	// Парсим результаты
+	return parsePingResults(string(output)), nil
+}
+
+func parsePingResults(output string) map[string]string {
+	results := make(map[string]string)
+	lines := strings.Split(output, "\n")
+
+	for _, line := range lines {
+		if strings.Contains(line, "Host") && strings.Contains(line, "is") {
+			parts := strings.Fields(line)
+			if len(parts) >= 6 {
+				host := parts[1]
+				status := parts[5]
+				status = strings.TrimRight(status, "'")
+				results[host] = status
+			}
+		}
+	}
+
+	return results
+}
+
+func getInventoryContent(inventoryName string) (string, error) {
+	var inv Inventory
+	if err := db.Where("name = ?", inventoryName).First(&inv).Error; err != nil {
+		return "", err
+	}
+	return inv.Content, nil
 }
